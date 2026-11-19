@@ -1,0 +1,1253 @@
+
+---
+title: "Analiza strategii tempa biegaczy Berlin Marathon"
+subtitle: "Porównanie PCA i skalowania wielowymiarowego (MDS)"
+author: "Weronika Zacłona, Mikołaj Szmid"
+lang: pl
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: projekt2-sad
+---
+
+# Wprowadzenie
+
+Bieg maratoński, rozgrywany na dystansie 42,195 km, stanowi jedno z najbardziej wymagających wyzwań w sportach wytrzymałościowych. Osiągnięty rezultat zależy nie tylko od przygotowania fizycznego zawodnika, lecz także od umiejętności odpowiedniego rozłożenia wysiłku na całej trasie. Dwóch biegaczy uzyskujących zbliżony czas końcowy może realizować zupełnie odmienne strategie: utrzymywać względnie stałe tempo, stopniowo przyspieszać lub znacząco zwalniać w końcowej fazie biegu. Sam wynik końcowy nie odzwierciedla zatem w pełni przebiegu rywalizacji.
+
+Szczególnie interesującym zagadnieniem jest zróżnicowanie strategii tempa wśród zawodników o odmiennym poziomie sportowym. Istotne znaczenie może mieć zarówno szybkość pokonywania kolejnych odcinków, jak i zdolność do utrzymywania równomiernego tempa pomimo narastającego zmęczenia. W tym kontekście uwagę zwracają zjawiska positive split i negative split, oznaczające odpowiednio wolniejszą lub szybszą drugą połowę biegu względem pierwszej. Ważnym elementem charakterystyki przebiegu maratonu jest również skala spowolnienia obserwowanego na końcowych kilometrach dystansu.
+
+Zróżnicowanie sposobu rozłożenia wysiłku można rozpatrywać także w odniesieniu do cech uczestników, takich jak płeć, narodowość czy osiągany poziom sportowy. Interesująca pozostaje również kwestia zmian zachodzących w kolejnych latach, związanych między innymi z rozwojem metod treningowych, technologii sportowej i rosnącą popularnością biegów długodystansowych. Nie przesądza to jednak o występowaniu różnic między poszczególnymi grupami zawodników.
+
+Berlin Marathon stanowi interesujący przedmiot badań ze względu na międzynarodowy charakter wydarzenia, wieloletnią historię oraz dużą liczbę uczestników reprezentujących różne poziomy zaawansowania. Dostępność indywidualnych wyników i międzyczasów z lat 1999–2019 stwarza możliwość spojrzenia na osiągnięcia maratończyków nie tylko przez pryzmat końcowej klasyfikacji, lecz także przez charakterystykę tempa na całym dystansie.
+
+Wielowymiarowy charakter tych danych rodzi pytanie, czy za pozornie złożonymi różnicami w przebiegu biegu kryje się mniejsza liczba podstawowych wymiarów opisujących strategie zawodników. Równie interesujące jest ustalenie, czy podobieństwo czasów końcowych oznacza również podobieństwo sposobu pokonywania dystansu oraz w jakim stopniu odmienne strategie występują wśród biegaczy reprezentujących zbliżony poziom sportowy.
+
+# Dane i metodyka
+
+## Wczytanie i integracja danych
+
+```{python}
+#| label: wczytanie-danych
+#| echo: false
+
+from pathlib import Path
+import pandas as pd
+
+DATA_DIR = Path("data/raw")
+
+files = sorted(DATA_DIR.rglob("results-*.csv"))
+
+if not files:
+    raise FileNotFoundError("Nie znaleziono plików CSV w data/raw/")
+
+print(f"Liczba znalezionych plików: {len(files)}")
+
+dataframes = []
+file_info = []
+
+for file in files:
+    df = pd.read_csv(file, sep=None, engine="python", dtype=str)
+
+    file_year = int(file.stem.split("-")[1])
+
+    if "year" in df.columns:
+        years = pd.to_numeric(df["year"], errors="coerce")
+        inconsistent = years.notna() & (years != file_year)
+
+        if inconsistent.any():
+            raise ValueError(f"Niezgodne lata w pliku {file.name}")
+    else:
+        df["year"] = str(file_year)
+
+    df["source_file"] = file.name
+    dataframes.append(df)
+
+    file_info.append({
+        "rok": file_year,
+        "liczba_zawodnikow": len(df),
+        "liczba_kolumn": len(df.columns)
+    })
+
+data = pd.concat(dataframes, ignore_index=True)
+file_summary = pd.DataFrame(file_info).sort_values("rok")
+
+print(f"Łączna liczba obserwacji: {len(data):,}")
+print(f"Zakres lat: {file_summary['rok'].min()}–{file_summary['rok'].max()}")
+
+
+assert len(data) == file_summary["liczba_zawodnikow"].sum()
+```
+
+
+## Kontrola kompletności danych
+
+```{python}
+#| label: kontrola-jakosci
+#| echo: false
+
+from IPython.display import display, Markdown
+
+data = data.replace(r"^\s*$", pd.NA, regex=True)
+
+missing = pd.DataFrame({
+    "Zmienna": data.columns,
+    "Brakujące dane (%)": data.isna().mean().values * 100
+})
+
+missing = missing[missing["Brakujące dane (%)"] > 0]
+missing = missing.sort_values("Brakujące dane (%)", ascending=False)
+
+display(
+    missing.style
+    .hide(axis="index")
+    .format({"Brakujące dane (%)": "{:.2f}%"})
+)
+
+
+```
+
+Analizowany zbiór charakteryzuje się wysoką kompletnością danych. Największy udział braków dotyczy przynależności klubowej (54,94%), dlatego zmienna ta została wyłączona z dalszej analizy. Brak czasu osiągnięcia 40. kilometra dotyczy 4,53% obserwacji, przy czym niemal wszystkie te przypadki pochodzą z edycji z 2003 roku. Ponieważ zawodnicy ci mają zapisany czas ukończenia maratonu, brak pomiaru nie oznacza nieukończenia biegu. W analizach wymagających pełnego zestawu międzyczasów zostaną wykorzystane wyłącznie obserwacje z kompletnymi i poprawnymi pomiarami. Pozostałe braki danych mają marginalny charakter.
+
+
+## Weryfikacja i przygotowanie danych czasowych
+
+```{python}
+#| label: przygotowanie-czasow
+#| echo: false
+
+import numpy as np
+from IPython.display import display
+
+time_cols = [
+    "split_5k", "split_10k", "split_15k",
+    "split_20k", "time_half", "split_25k",
+    "split_30k", "split_35k", "split_40k",
+    "time_full"
+]
+
+times = data[time_cols].apply(
+    lambda col: pd.to_timedelta(col, errors="coerce").dt.total_seconds()
+)
+
+times = times.where(times > 0)
+
+chronological = times.diff(axis=1).iloc[:, 1:].gt(0).all(axis=1)
+complete = times.notna().all(axis=1)
+valid = complete & chronological
+
+data_clean = data.loc[valid].copy()
+times_clean = times.loc[valid].copy()
+
+data_clean[["year", "time_full", "gender", "nationality"]] = (
+    data_clean[["year", "time_full", "gender", "nationality"]]
+)
+
+summary = pd.DataFrame({
+    "Etap": [
+        "Wszystkie obserwacje",
+        "Kompletne, dodatnie pomiary czasowe",
+        "Poprawna kolejność międzyczasów"
+    ],
+    "Liczba obserwacji": [
+        len(data),
+        int(complete.sum()),
+        int(valid.sum())
+    ]
+})
+
+summary["Udział (%)"] = (
+    summary["Liczba obserwacji"] / len(data) * 100
+)
+
+display(
+    summary.style.hide(axis="index")
+    .format({"Udział (%)": "{:.2f}%"})
+)
+```
+
+
+Po weryfikacji kompletności, dodatnich wartości i chronologii międzyczasów do dalszej analizy pełnych profili biegu zakwalifikowano 632 183 obserwacje, stanowiące 93,14% pierwotnego zbioru. Wśród 632 204 rekordów z kompletnymi, dodatnimi pomiarami wykryto 21 przypadków nieprawidłowej kolejności międzyczasów. Pozostałe obserwacje wykluczono z tego wariantu analizy z powodu brakujących lub niedodatnich pomiarów.
+
+
+## Wyznaczenie tempa biegu
+
+
+Na podstawie czasów narastających obliczono tempo na kolejnych odcinkach maratonu, wyrażone w minutach na kilometr. Dla każdego odcinka wyznaczono różnicę między czasem jego zakończenia a czasem osiągnięcia poprzedniego punktu pomiarowego, a następnie podzielono ją przez długość odcinka.
+
+\[
+t_i=\frac{T_i-T_{i-1}}{60(d_i-d_{i-1})}
+\]
+
+gdzie \(T_i\) oznacza czas narastający w sekundach, a \(d_i\) – przebyty dystans w kilometrach. Przy obliczeniach uwzględniono nierówne długości odcinków prowadzących do półmaratonu oraz mety (42,195 km).
+
+
+```{python}
+#| label: tempo-biegu
+#| echo: false
+
+import numpy as np
+import pandas as pd
+from IPython.display import display, Markdown
+
+punkty = {
+    "split_5k": 5,
+    "split_10k": 10,
+    "split_15k": 15,
+    "split_20k": 20,
+    "time_half": 21.0975,
+    "split_25k": 25,
+    "split_30k": 30,
+    "split_35k": 35,
+    "split_40k": 40,
+    "time_full": 42.195
+}
+
+poprzedni_czas = pd.Series(0.0, index=times_clean.index)
+poprzedni_km = 0.0
+tempo_cols = []
+dlugosci = []
+
+for kolumna, km in punkty.items():
+    nazwa = f"tempo_{str(km).replace('.', '_')}km"
+    dlugosc = km - poprzedni_km
+
+    data_clean[nazwa] = (
+        (times_clean[kolumna] - poprzedni_czas) / 60 / dlugosc
+    )
+
+    tempo_cols.append(nazwa)
+    dlugosci.append(dlugosc)
+    poprzedni_czas = times_clean[kolumna]
+    poprzedni_km = km
+
+data_clean["tempo_srednie"] = times_clean["time_full"] / 60 / 42.195
+
+tempa = data_clean[tempo_cols].to_numpy()
+wagi = np.array(dlugosci) / 42.195
+
+data_clean["tempo_zmiennosc"] = (
+    np.sqrt(
+        np.sum(
+            wagi * (tempa - data_clean["tempo_srednie"].to_numpy()[:, None]) ** 2,
+            axis=1
+        )
+    ) / data_clean["tempo_srednie"].to_numpy() * 100
+)
+
+data_clean["roznica_polow_min"] = (
+    times_clean["time_full"] - 2 * times_clean["time_half"]
+) / 60
+
+data_clean["strategia"] = np.select(
+    [
+        data_clean["roznica_polow_min"] > 0,
+        data_clean["roznica_polow_min"] < 0
+    ],
+    ["Positive split", "Negative split"],
+    default="Równe połowy"
+)
+
+statystyki = pd.DataFrame({
+    "Charakterystyka": [
+        "Średnie tempo biegu (min/km)",
+        "Zmienność tempa (%)",
+        "Różnica między połowami (min)"
+    ],
+    "Średnia": [
+        data_clean["tempo_srednie"].mean(),
+        data_clean["tempo_zmiennosc"].mean(),
+        data_clean["roznica_polow_min"].mean()
+    ],
+    "Mediana": [
+        data_clean["tempo_srednie"].median(),
+        data_clean["tempo_zmiennosc"].median(),
+        data_clean["roznica_polow_min"].median()
+    ],
+    "Odch. std.": [
+        data_clean["tempo_srednie"].std(),
+        data_clean["tempo_zmiennosc"].std(),
+        data_clean["roznica_polow_min"].std()
+    ]
+})
+
+display(
+    statystyki.style.hide(axis="index")
+    .format({
+        "Średnia": "{:.2f}",
+        "Mediana": "{:.2f}",
+        "Odch. std.": "{:.2f}"
+    })
+)
+
+strategie = data_clean["strategia"].value_counts(normalize=True) * 100
+
+display(Markdown(
+    f"**Strategie biegu:** Positive split – "
+    f"{strategie.get('Positive split', 0):.1f}%, "
+    f"negative split – {strategie.get('Negative split', 0):.1f}%, "
+    f"równe połowy – {strategie.get('Równe połowy', 0):.1f}%."
+))
+```
+
+Średnie tempo biegu wyniosło 5,89 min/km, a mediana 5,78 min/km. Przeciętny współczynnik zmienności tempa wyniósł 6,79%, co wskazuje na zróżnicowanie szybkości pokonywania kolejnych odcinków trasy. Im wyższa wartość tego wskaźnika, tym mniej równomierne tempo zawodnika.
+
+W analizie rozróżniono trzy strategie biegu:
+- **Positive split** – druga połowa maratonu została pokonana wolniej niż pierwsza.
+- **Negative split** – druga połowa została pokonana szybciej niż pierwsza.
+- **Równe połowy** – obie połowy pokonano w takim samym czasie.
+
+Dominowała strategia *positive split*, którą odnotowano u 87,6% zawodników. Strategię *negative split* zastosowało 12,3% biegaczy, natomiast jednakowe czasy obu połówek uzyskało około 0,1%. Przeciętna różnica między czasem drugiej i pierwszej połowy wynosiła 12,09 minuty, co wskazuje na wyraźną przewagę spowolnienia w drugiej części maratonu.
+
+# Eksploracyjna analiza danych (EDA)
+
+## Rozkłady zmiennych i obserwacje odstające
+
+```{python}
+#| label: eda-rozklady
+#| echo: false
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display
+
+sns.set_theme(style="whitegrid")
+
+zmienne = {
+    "tempo_srednie": "Średnie tempo (min/km)",
+    "tempo_zmiennosc": "Zmienność tempa (%)",
+    "roznica_polow_min": "Różnica między połowami (min)"
+}
+
+opis = data_clean[list(zmienne)].agg(
+    ["mean", "median", "std", "skew"]
+).T
+
+opis["Q1"] = data_clean[list(zmienne)].quantile(0.25)
+opis["Q3"] = data_clean[list(zmienne)].quantile(0.75)
+
+opis = opis.rename(index=zmienne, columns={
+    "mean": "Średnia",
+    "median": "Mediana",
+    "std": "Odch. std.",
+    "skew": "Skośność"
+})
+
+display(
+    opis[["Średnia", "Mediana", "Odch. std.", "Skośność", "Q1", "Q3"]]
+    .style.format("{:.2f}")
+)
+
+fig, axes = plt.subplots(3, 1, figsize=(9, 7))
+
+for ax, (col, label) in zip(axes, zmienne.items()):
+    x = data_clean[col].dropna()
+    q01, q99 = x.quantile([0.01, 0.99])
+
+    sns.histplot(
+        x[(x >= q01) & (x <= q99)],
+        bins=50, ax=ax, color="#477ca8"
+    )
+
+    ax.set_title(label, fontsize=11)
+    ax.set_xlabel(label)
+    ax.set_ylabel("Liczba zawodników")
+
+plt.tight_layout()
+plt.show()
+
+```
+
+Rozkłady analizowanych zmiennych wykazują asymetrię prawostronną, jednak jej nasilenie jest zróżnicowane. Najbardziej zbliżony do symetrycznego jest rozkład średniego tempa biegu (skośność 0,45), którego mediana wynosi 5,78 min/km. Połowa zawodników osiągnęła średnie tempo mieszczące się w przedziale od 5,18 do 6,54 min/km.
+
+Znacznie większą asymetrię zaobserwowano w przypadku zmienności tempa (skośność 2,65). Mediana wynosi 5,38%, podczas gdy średnia osiąga 6,79%. Oznacza to, że większość zawodników utrzymywała stosunkowo równomierne tempo, natomiast część charakteryzowała się znacznie większymi wahaniami szybkości na poszczególnych odcinkach.
+
+Podobną tendencję wykazuje różnica między czasami obu połówek maratonu (skośność 1,52). Jej mediana wynosi 8,70 min, a średnia 12,09 min. Dodatnie wartości dominują w rozkładzie, co potwierdza, że większość zawodników pokonywała drugą połowę dystansu wolniej niż pierwszą. Jednocześnie znaczne zróżnicowanie tej zmiennej wskazuje, że skala spowolnienia była bardzo indywidualna.
+
+Zaobserwowana asymetria i obecność wartości skrajnych mają znaczenie dla dalszej analizy wielowymiarowej, ponieważ mogą wpływać na położenie obiektów w przestrzeni PCA i MDS. Z tego względu istotna będzie ocena wrażliwości uzyskanych wyników na obserwacje odstające.
+
+
+## Strategie tempa a płeć zawodników
+
+```{python}
+#| label: eda-plec
+#| echo: false
+#| fig-width: 9
+#| fig-height: 4
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+df = data_clean[data_clean["gender"].isin(["M", "W"])].copy()
+df["Płeć"] = df["gender"].map({"M": "Mężczyźni", "W": "Kobiety"})
+df["Czas (h)"] = times_clean.loc[df.index, "time_full"] / 3600
+
+wyniki = df.groupby("Płeć").agg(
+    Liczba=("gender", "size"),
+    Mediana_zmiennosci=("tempo_zmiennosc", "median"),
+    Mediana_roznicy=("roznica_polow_min", "median"),
+    Negative_split=("strategia", lambda x: (x == "Negative split").mean() * 100)
+)
+
+wyniki = wyniki.rename(columns={
+    "Mediana_zmiennosci": "Zmienność tempa – mediana (%)",
+    "Mediana_roznicy": "Różnica połówek – mediana (min)",
+    "Negative_split": "Negative split (%)"
+})
+
+display(
+    wyniki.style.format({
+        "Liczba": "{:,.0f}",
+        "Zmienność tempa – mediana (%)": "{:.2f}",
+        "Różnica połówek – mediana (min)": "{:.2f}",
+        "Negative split (%)": "{:.2f}"
+    })
+)
+
+przedzialy = [2, 3, 3.5, 4, 4.5, 5, 6, 8]
+etykiety = ["2–3", "3–3,5", "3,5–4", "4–4,5", "4,5–5", "5–6", "6–8"]
+
+df["Przedział czasu (h)"] = pd.cut(
+    df["Czas (h)"], bins=przedzialy, labels=etykiety
+)
+
+porownanie = (
+    df.groupby(["Przedział czasu (h)", "Płeć"], observed=True)
+    .agg(
+        n=("gender", "size"),
+        udzial=("strategia", lambda x: (x == "Negative split").mean() * 100)
+    )
+    .reset_index()
+)
+
+porownanie = porownanie[porownanie["n"] >= 100]
+
+plt.figure(figsize=(9, 4))
+sns.lineplot(
+    data=porownanie,
+    x="Przedział czasu (h)",
+    y="udzial",
+    hue="Płeć",
+    marker="o"
+)
+
+plt.ylabel("Udział negative split (%)")
+plt.xlabel("Czas ukończenia maratonu (godz.)")
+plt.title("Negative split według płci i czasu ukończenia")
+plt.legend(title="")
+plt.tight_layout()
+plt.show()
+```
+
+
+Kobiety charakteryzowały się bardziej równomiernym tempem biegu niż mężczyźni – mediana zmienności tempa wyniosła odpowiednio 4,80% i 5,59%. Rzadziej również zwalniały w drugiej połowie maratonu (mediana spowolnienia 8,30 wobec 8,83 min).
+
+Szybszą drugą połowę biegu (*negative split*) odnotowano u 13,95% kobiet i 11,86% mężczyzn. Różnica ta utrzymywała się również w większości przedziałów czasu ukończenia maratonu. Jednocześnie wraz z wydłużaniem czasu końcowego udział zawodników uzyskujących *negative split* na ogół malał u obu płci.
+
+## Strategie tempa a poziom sportowy
+
+```{python}
+#| label: eda-poziom-sportowy
+#| echo: false
+#| fig-width: 9
+#| fig-height: 4
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sport = data_clean.copy()
+sport["czas_h"] = times_clean["time_full"] / 3600
+
+granice = [2, 3, 3.5, 4, 4.5, 5, 6, 8, float("inf")]
+etykiety = [
+    "2–3", "3–3,5", "3,5–4", "4–4,5",
+    "4,5–5", "5–6", "6–8", "8+"
+]
+
+sport["grupa"] = pd.cut(
+    sport["czas_h"],
+    bins=granice,
+    labels=etykiety,
+    right=False
+)
+
+wyniki_sport = (
+    sport.groupby("grupa", observed=True)
+    .agg(
+        liczba=("tempo_srednie", "size"),
+        zmiennosc=("tempo_zmiennosc", "median"),
+        spowolnienie=("roznica_polow_min", "median"),
+        negative_split=("strategia", lambda x: (x == "Negative split").mean() * 100)
+    )
+    .reset_index()
+)
+
+display(
+    wyniki_sport.rename(columns={
+        "grupa": "Czas ukończenia (h)",
+        "liczba": "Liczba",
+        "zmiennosc": "Mediana zmienności (%)",
+        "spowolnienie": "Mediana różnicy połówek (min)",
+        "negative_split": "Negative split (%)"
+    }).style.hide(axis="index").format({
+        "Mediana zmienności (%)": "{:.2f}",
+        "Mediana różnicy połówek (min)": "{:.2f}",
+        "Negative split (%)": "{:.1f}"
+    })
+)
+
+fig, ax = plt.subplots(figsize=(9, 4))
+wyniki_wykres = wyniki_sport[wyniki_sport["liczba"] >= 100]
+sns.lineplot(
+    data=wyniki_wykres,
+    x="grupa",
+    y="zmiennosc",
+    marker="o",
+    ax=ax
+)
+
+ax.set_xlabel("Czas ukończenia maratonu (godz.)")
+ax.set_ylabel("Mediana zmienności tempa (%)")
+ax.set_title("Równomierność tempa a czas ukończenia maratonu")
+
+plt.tight_layout()
+plt.show()
+```
+
+Wraz z wydłużaniem czasu ukończenia maratonu obserwowano coraz większą nierównomierność tempa. Mediana współczynnika zmienności wzrosła z 2,35% wśród zawodników kończących bieg w 2–3 godziny do 11,10% w grupie 6–8 godzin. Jednocześnie mediana spowolnienia w drugiej połowie zwiększyła się z 2,27 do 32,28 minuty, a udział zawodników uzyskujących *negative split* zmniejszył się z 17,9% do 1,3%.
+
+Wyniki wskazują, że zawodnicy osiągający krótsze czasy końcowe charakteryzowali się na ogół bardziej równomiernym przebiegiem biegu.
+
+## Strategie tempa a narodowość zawodników
+
+```{python}
+#| label: eda-narodowosc
+#| echo: false
+
+kraje = data_clean.copy()
+
+kraje["nationality"] = kraje["nationality"].replace({
+    "GER": "DEU",
+    "DEN": "DNK",
+    "NED": "NLD"
+})
+
+najliczniejsze = kraje["nationality"].value_counts().head(8).index
+
+wyniki_kraje = (
+    kraje[kraje["nationality"].isin(najliczniejsze)]
+    .groupby("nationality")
+    .agg(
+        liczba=("strategia", "size"),
+        zmiennosc=("tempo_zmiennosc", "median"),
+        spowolnienie=("roznica_polow_min", "median"),
+        negative_split=("strategia", lambda x: (x == "Negative split").mean() * 100),
+        tempo=("tempo_srednie", "median")
+    )
+    .sort_values("liczba", ascending=False)
+)
+
+wyniki_kraje.index.name = "Narodowość"
+wyniki_kraje = wyniki_kraje.rename(index={
+    "DEU": "Niemcy",
+    "DNK": "Dania",
+    "GBR": "Wielka Brytania",
+    "FRA": "Francja",
+    "NLD": "Holandia",
+    "USA": "USA",
+    "ITA": "Włochy",
+    "SWE": "Szwecja"
+})
+display(
+    wyniki_kraje.rename(columns={
+        "liczba": "Liczba",
+        "zmiennosc": "Zmienność tempa (%)",
+        "spowolnienie": "Spowolnienie (min)",
+        "negative_split": "Negative split (%)",
+        "tempo": "Tempo (min/km)"
+    }).style.format({
+        "Liczba": "{:,.0f}",
+        "Zmienność tempa (%)": "{:.2f}",
+        "Spowolnienie (min)": "{:.2f}",
+        "Negative split (%)": "{:.1f}",
+        "Tempo (min/km)": "{:.2f}"
+    })
+)
+```
+
+Wśród ośmiu najliczniej reprezentowanych narodowości najbardziej równomierne tempo utrzymywali zawodnicy z Holandii (mediana zmienności 4,65%), natomiast największą zmienność odnotowano wśród reprezentantów USA (5,91%). Holendrzy najczęściej uzyskiwali również *negative split* (15,4%) i charakteryzowali się najmniejszym spowolnieniem w drugiej połowie maratonu (6,88 min). Największe spowolnienie występowało wśród zawodników z USA (10,52 min). Różnice te mogą być częściowo związane ze zróżnicowaniem poziomu sportowego oraz struktury uczestników poszczególnych grup.
+
+## Zmiany strategii tempa w latach 1999–2019
+
+```{python}
+#| label: eda-lata
+#| echo: false
+#| fig-width: 9
+#| fig-height: 4
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+lata = data_clean.copy()
+lata["year"] = pd.to_numeric(lata["year"])
+
+wyniki_lata = (
+    lata.groupby("year")
+    .agg(
+        liczba=("strategia", "size"),
+        zmiennosc=("tempo_zmiennosc", "median"),
+        spowolnienie=("roznica_polow_min", "median"),
+        negative_split=("strategia", lambda x: (x == "Negative split").mean() * 100),
+        tempo=("tempo_srednie", "median")
+    )
+    .reset_index()
+)
+
+fig, ax = plt.subplots(figsize=(9, 4))
+
+sns.lineplot(
+    data=wyniki_lata,
+    x="year",
+    y="zmiennosc",
+    marker="o",
+    ax=ax
+)
+
+ax.set_xlabel("Rok maratonu")
+ax.set_ylabel("Mediana zmienności tempa (%)")
+ax.set_title("Zmiany równomierności tempa w latach 1999–2019")
+ax.set_xticks(range(1999, 2020, 2))
+
+plt.tight_layout()
+plt.show()
+
+display(
+    wyniki_lata[
+        wyniki_lata["year"].isin([1999, 2004, 2009, 2014, 2019])
+    ].rename(columns={
+        "year": "Rok",
+        "liczba": "Liczba",
+        "zmiennosc": "Zmienność tempa (%)",
+        "spowolnienie": "Spowolnienie (min)",
+        "negative_split": "Negative split (%)",
+        "tempo": "Tempo (min/km)"
+    }).style.hide(axis="index").format({
+        "Zmienność tempa (%)": "{:.2f}",
+        "Spowolnienie (min)": "{:.2f}",
+        "Negative split (%)": "{:.1f}",
+        "Tempo (min/km)": "{:.2f}"
+    })
+)
+```
+
+W latach 1999–2019 nie zaobserwowano jednoznacznego trendu zmian równomierności tempa biegu. Mediana zmienności tempa podlegała wyraźnym wahaniom, osiągając m.in. 4,78% w 2004 roku i 6,78% w 2009 roku. W 2019 roku wyniosła 4,80%, co wskazuje na bardziej równomierne tempo niż w 1999 roku (5,77%).
+
+Różnice między edycjami widoczne są również w udziale zawodników pokonujących drugą połowę maratonu szybciej od pierwszej. W 2004 roku stanowili oni 17,9% uczestników, w 2009 roku zaledwie 7,0%, a w 2019 roku 14,1%. Wyniki wskazują na znaczne zróżnicowanie strategii tempa między poszczególnymi edycjami, bez wyraźnej tendencji długookresowej.
+
+## Tempo na kolejnych odcinkach maratonu
+
+```{python}
+#| label: eda-odcinki
+#| echo: false
+#| fig-width: 9
+#| fig-height: 4.5
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+punkty_5km = [
+    "split_5k", "split_10k", "split_15k", "split_20k",
+    "split_25k", "split_30k", "split_35k", "split_40k"
+]
+
+czasy = times_clean[punkty_5km].to_numpy()
+odcinki = np.diff(
+    np.column_stack([np.zeros(len(czasy)), czasy]),
+    axis=1
+)
+
+tempa = odcinki / 60 / 5
+
+etykiety = [f"{i}–{i+5}" for i in range(0, 40, 5)]
+
+mediana = np.median(tempa, axis=0)
+q1 = np.percentile(tempa, 25, axis=0)
+q3 = np.percentile(tempa, 75, axis=0)
+
+fig, ax = plt.subplots(figsize=(9, 4.5))
+
+x = np.arange(len(etykiety))
+
+ax.plot(x, mediana, marker="o", linewidth=2, label="Mediana")
+ax.fill_between(x, q1, q3, alpha=0.2, label="Q1–Q3")
+
+ax.set_xticks(x, etykiety)
+ax.set_xlabel("Odcinek trasy (km)")
+ax.set_ylabel("Tempo (min/km)")
+ax.set_title("Tempo biegu na kolejnych odcinkach maratonu")
+ax.legend()
+ax.grid(alpha=0.25)
+
+plt.tight_layout()
+plt.show()
+
+print(
+    f"Mediana tempa na pierwszych 5 km: {mediana[0]:.2f} min/km; "
+    f"na odcinku 35–40 km: {mediana[-1]:.2f} min/km."
+)
+```
+
+W pierwszych 15 km maratonu tempo zawodników pozostawało względnie stabilne, a jego mediana wynosiła około 5,5 min/km. Na kolejnych odcinkach obserwowano stopniowe spowolnienie, szczególnie wyraźne po 30. kilometrze. Mediana tempa wzrosła z 5,54 min/km na pierwszych 5 km do 6,30 min/km na odcinku 35–40 km, co oznacza spowolnienie o około 46 sekund na kilometr.
+
+Jednocześnie zwiększał się rozstęp między pierwszym a trzecim kwartylem, wskazując na rosnące zróżnicowanie tempa zawodników w końcowej części maratonu. Wyniki potwierdzają, że utrzymanie równomiernego tempa staje się trudniejsze wraz z pokonywanym dystansem.
+
+# Analiza składowych głównych (PCA)
+
+## Dobór zmiennych i analiza korelacji
+
+```{python}
+#| label: pca-zmienne
+#| echo: false
+#| fig-width: 8
+#| fig-height: 6
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+punkty_5km = [
+    "split_5k", "split_10k", "split_15k", "split_20k",
+    "split_25k", "split_30k", "split_35k", "split_40k"
+]
+
+czasy_40 = times_clean[punkty_5km].to_numpy()
+
+czasy_odcinkow = np.diff(
+    np.column_stack([np.zeros(len(czasy_40)), czasy_40]),
+    axis=1
+)
+
+tempa_5km = czasy_odcinkow / 60 / 5
+srednie_tempo_40 = times_clean["split_40k"].to_numpy() / 60 / 40
+
+wzgledne_tempa = (
+    tempa_5km / srednie_tempo_40[:, None] - 1
+) * 100
+
+nazwy = [f"{i}–{i+5} km" for i in range(0, 40, 5)]
+
+X_pelne = pd.DataFrame(
+    wzgledne_tempa,
+    columns=nazwy,
+    index=data_clean.index
+)
+
+X = X_pelne.iloc[:, :7].copy()
+
+diagnostyka = pd.DataFrame({
+    "Zmienna": X.columns,
+    "Odch. std.": X.std().values,
+    "Skośność": X.skew().values
+})
+
+display(
+    diagnostyka.style.hide(axis="index")
+    .format({
+        "Odch. std.": "{:.2f}",
+        "Skośność": "{:.2f}"
+    })
+)
+
+korelacje = X.corr()
+
+fig, ax = plt.subplots(figsize=(8, 6))
+
+sns.heatmap(
+    korelacje,
+    annot=True,
+    fmt=".2f",
+    cmap="RdBu_r",
+    vmin=-1,
+    vmax=1,
+    center=0,
+    square=True,
+    ax=ax
+)
+
+ax.set_title("Korelacje względnego tempa na odcinkach")
+plt.tight_layout()
+plt.show()
+```
+
+Macierz korelacji wskazuje na silne dodatnie zależności między tempem na początkowych odcinkach maratonu, np. między 0–5 a 5–10 km (r = 0,84). Z kolei między początkiem a końcową częścią biegu występują wyraźne korelacje ujemne, np. między 5–10 a 30–35 km (r = −0,79). Oznacza to, że zawodnicy pokonujący początkowe odcinki względnie szybciej częściej osiągali względnie wolniejsze tempo na późniejszych etapach biegu.
+
+Część tych zależności wynika jednak z samej konstrukcji zmiennych, ponieważ tempa poszczególnych odcinków odniesiono do indywidualnej średniej. Zaobserwowana struktura korelacji sugeruje możliwość opisania zróżnicowania strategii biegu za pomocą mniejszej liczby składowych głównych.
+
+
+Przed przeprowadzeniem analizy składowych głównych oceniono przydatność wybranego zestawu zmiennych. W tym celu zastosowano współczynnik Kaisera-Meyera-Olkina (KMO), określający adekwatność struktury korelacji, oraz test sferyczności Bartletta, weryfikujący hipotezę zerową o równości macierzy korelacji i macierzy jednostkowej. Za minimalnie akceptowalną wartość KMO przyjęto 0,50, natomiast w teście Bartletta zastosowano poziom istotności α = 0,05.
+
+
+## Ocena zasadności zastosowania PCA
+
+```{python}
+#| label: pca-diagnostyka
+#| echo: false
+
+import numpy as np
+import pandas as pd
+from scipy.stats import chi2
+from IPython.display import display
+
+R = X.corr().to_numpy(copy=True)
+n, p = X.shape
+
+R_inv = np.linalg.inv(R)
+
+partial = -R_inv / np.sqrt(
+    np.outer(np.diag(R_inv), np.diag(R_inv))
+)
+
+np.fill_diagonal(R, 0)
+np.fill_diagonal(partial, 0)
+
+kmo = (
+    np.sum(R**2)
+    / (np.sum(R**2) + np.sum(partial**2))
+)
+
+R_full = X.corr().to_numpy()
+sign, logdet = np.linalg.slogdet(R_full)
+
+if sign <= 0:
+    raise ValueError("Macierz korelacji nie jest dodatnio określona.")
+
+chi2_stat = -(n - 1 - (2*p + 5)/6) * logdet
+df_bartlett = p * (p - 1) // 2
+p_value = chi2.sf(chi2_stat, df_bartlett)
+
+diagnostyka_pca = pd.DataFrame({
+    "Miara": [
+        "KMO",
+        "Test Bartletta – χ²",
+        "Stopnie swobody",
+        "Test Bartletta – p"
+    ],
+    "Wartość": [
+        f"{kmo:.3f}",
+        f"{chi2_stat:.2f}",
+        str(df_bartlett),
+        f"{p_value:.3e}"
+    ]
+})
+
+display(diagnostyka_pca.style.hide(axis="index"))
+```
+
+
+Współczynnik KMO wyniósł 0,863, wskazując na bardzo dobrą adekwatność struktury korelacji do analizy składowych głównych. Test sferyczności Bartletta również potwierdził zasadność zastosowania PCA (χ²(21) = 3 387 209,13; p < 0,001), pozwalając odrzucić hipotezę o jednostkowej macierzy korelacji. Uzyskane wyniki uzasadniają przeprowadzenie redukcji wymiarowości wybranych zmiennych.
+
+
+## Wyznaczenie liczby składowych głównych
+
+```{python}
+#| label: pca-liczba-skladowych
+#| echo: false
+#| fig-width: 9
+#| fig-height: 4.5
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from IPython.display import display
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+pca = PCA()
+pca.fit(X_scaled)
+
+wartosci_wlasne = pca.explained_variance_
+wariancja = pca.explained_variance_ratio_ * 100
+skumulowana = np.cumsum(wariancja)
+
+wyniki_pca = pd.DataFrame({
+    "Składowa": [f"PC{i}" for i in range(1, len(wariancja) + 1)],
+    "Wartość własna (λ)": wartosci_wlasne,
+    "Wariancja (%)": wariancja,
+    "Skumulowana (%)": skumulowana
+})
+
+display(
+    wyniki_pca.style.hide(axis="index")
+    .format({
+        "Wartość własna (λ)": "{:.3f}",
+        "Wariancja (%)": "{:.2f}",
+        "Skumulowana (%)": "{:.2f}"
+    })
+)
+
+fig, ax1 = plt.subplots(figsize=(9, 4.5))
+x = np.arange(1, len(wariancja) + 1)
+
+ax1.plot(x, wartosci_wlasne, "o-", linewidth=2)
+ax1.axhline(1, color="gray", linestyle="--", label="Kryterium Kaisera (λ = 1)")
+ax1.set_xlabel("Numer składowej")
+ax1.set_ylabel("Wartość własna")
+ax1.set_xticks(x)
+ax1.set_title("Wykres osypiska i skumulowana wariancja wyjaśniona")
+
+ax2 = ax1.twinx()
+ax2.plot(x, skumulowana, "s--", color="darkorange")
+ax2.axhline(80, color="darkorange", linestyle=":", alpha=0.7)
+ax2.set_ylabel("Skumulowana wariancja (%)")
+ax2.set_ylim(0, 105)
+
+ax1.legend(loc="center right")
+plt.tight_layout()
+plt.show()
+
+n_kaiser = int(np.sum(wartosci_wlasne > 1))
+n_80 = int(np.searchsorted(skumulowana, 80) + 1)
+
+print(
+    f"Kryterium Kaisera: {n_kaiser} składowe. "
+    f"Próg 80% wariancji: {n_80} składowe."
+)
+```
+
+
+Wyniki trzech kryteriów wskazują na zasadność wyodrębnienia dwóch składowych głównych. Zgodnie z kryterium Kaisera wartości własne większe od 1 uzyskały wyłącznie PC1 (4,287) i PC2 (1,364). Pierwsza składowa wyjaśnia 61,24%, a druga 19,48% całkowitej wariancji, co daje łącznie 80,72%. Również wykres osypiska wskazuje na wyraźne wypłaszczenie po drugiej składowej. Oznacza to możliwość redukcji siedmiu zmiennych do dwóch wymiarów przy zachowaniu większości informacji o zróżnicowaniu względnego tempa zawodników.
+
+
+## Interpretacja składowych głównych
+
+```{python}
+#| label: pca-ladunki
+#| echo: false
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+scores = pca.transform(X_scaled)
+
+ladunki = pd.DataFrame(
+    pca.components_[:2].T * np.sqrt(pca.explained_variance_[:2]),
+    index=X.columns,
+    columns=["PC1", "PC2"]
+)
+
+display(ladunki.style.format("{:.3f}"))
+
+fig, ax = plt.subplots(figsize=(7, 5))
+
+sns.heatmap(
+    ladunki,
+    annot=True,
+    fmt=".2f",
+    cmap="RdBu_r",
+    vmin=-1,
+    vmax=1,
+    center=0,
+    ax=ax
+)
+
+ax.set_title("Ładunki czynnikowe PC1 i PC2")
+ax.set_xlabel("Składowa główna")
+ax.set_ylabel("Odcinek maratonu")
+
+plt.tight_layout()
+plt.show()
+```
+
+Pierwsza składowa główna (PC1), wyjaśniająca 61,24% wariancji, opisuje kontrast między początkową a późniejszą fazą biegu. Dodatnie ładunki dla odcinków 0–20 km (najwyższy: 0,928 dla 5–10 km) oraz ujemne dla 25–35 km (najniższy: −0,888 dla 30–35 km) wskazują, że wyższe wartości PC1 odpowiadają względnie wolniejszemu początkowi i szybszej późniejszej części dystansu.
+
+Druga składowa (PC2), wyjaśniająca 19,48% wariancji, związana jest przede wszystkim z tempem w środkowej części maratonu, szczególnie na odcinku 20–25 km (ładunek 0,916). Obie składowe łącznie wyjaśniają 80,72% wariancji, umożliwiając dwuwymiarową charakterystykę zróżnicowania strategii tempa.
+
+## Wizualizacja zawodników w przestrzeni PC1–PC2
+
+```{python}
+#| label: pca-wizualizacja
+#| echo: false
+#| fig-width: 10
+#| fig-height: 5
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+wyniki_pc = pd.DataFrame(
+    scores[:, :2],
+    columns=["PC1", "PC2"],
+    index=X.index
+)
+
+wyniki_pc["Strategia"] = data_clean.loc[X.index, "strategia"]
+wyniki_pc["Płeć"] = (
+    data_clean.loc[X.index, "gender"]
+    .map({"M": "Mężczyźni", "W": "Kobiety"})
+)
+
+proba = wyniki_pc.sample(
+    n=min(5000, len(wyniki_pc)),
+    random_state=42
+)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+sns.scatterplot(
+    data=proba,
+    x="PC1",
+    y="PC2",
+    hue="Strategia",
+    hue_order=["Positive split", "Negative split", "Równe połowy"],
+    alpha=0.45,
+    s=12,
+    linewidth=0,
+    ax=axes[0]
+)
+
+axes[0].set_title("Rozmieszczenie według strategii")
+axes[0].legend(
+    title="",
+    loc="upper center",
+    bbox_to_anchor=(0.5, -0.17),
+    ncol=2,
+    fontsize=8
+)
+
+sns.scatterplot(
+    data=proba,
+    x="PC1",
+    y="PC2",
+    hue="Płeć",
+    hue_order=["Kobiety", "Mężczyźni"],
+    alpha=0.40,
+    s=12,
+    linewidth=0,
+    ax=axes[1]
+)
+
+axes[1].set_title("Rozmieszczenie według płci")
+axes[1].legend(
+    title="",
+    loc="upper center",
+    bbox_to_anchor=(0.5, -0.17),
+    ncol=2,
+    fontsize=8
+)
+
+for ax in axes:
+    ax.set_xlabel("PC1 (61,24% wariancji)")
+    ax.set_ylabel("PC2 (19,48% wariancji)")
+    ax.axhline(0, color="gray", linewidth=0.7, alpha=0.5)
+    ax.axvline(0, color="gray", linewidth=0.7, alpha=0.5)
+
+plt.tight_layout()
+plt.show()
+```
+
+Rozmieszczenie zawodników w przestrzeni dwóch składowych głównych wskazuje na częściowe zróżnicowanie profili tempa. Osoby uzyskujące *positive split* koncentrują się głównie po stronie ujemnych wartości PC1, natomiast zawodnicy z *negative split* częściej osiągają dodatnie wartości tej składowej. Potwierdza to interpretację PC1 jako wymiaru opisującego kontrast między tempem początkowym a późniejszą częścią dystansu.
+
+W przypadku płci zaobserwowano znaczne nakładanie się rozkładów kobiet i mężczyzn, bez wyraźnego rozdzielenia grup. Sugeruje to, że indywidualne różnice w strategiach tempa są większe niż różnice widoczne między płciami w dwuwymiarowej reprezentacji PCA.
+
+
+## Ocena jakości reprezentacji zmiennych (cos²)
+
+```{python}
+#| label: pca-cos2
+#| echo: false
+#| fig-width: 9
+#| fig-height: 4.5
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display
+
+cos2 = ladunki[["PC1", "PC2"]] ** 2
+
+cos2["Łącznie PC1 + PC2"] = cos2.sum(axis=1)
+
+display(
+    cos2.rename(columns={
+        "PC1": "PC1",
+        "PC2": "PC2",
+        "Łącznie PC1 + PC2": "Łącznie"
+    }).style.format("{:.3f}")
+    .background_gradient(
+        cmap="Blues",
+        subset=["Łącznie PC1 + PC2"] if False else ["Łącznie"]
+    )
+)
+
+fig, ax = plt.subplots(figsize=(9, 4.5))
+
+cos2[["PC1", "PC2"]].plot(
+    kind="bar",
+    stacked=True,
+    ax=ax,
+    color=["#477ca8", "#e6a04b"],
+    width=0.7
+)
+
+ax.axhline(0.8, color="gray", linestyle="--",
+           label="80% wariancji zmiennej")
+
+ax.set_xlabel("Odcinek maratonu")
+ax.set_ylabel("Udział wyjaśnionej wariancji")
+ax.set_title("Jakość reprezentacji zmiennych przez PC1 i PC2")
+ax.set_ylim(0, 1.05)
+ax.tick_params(axis="x", rotation=0)
+ax.legend(title="")
+ax.set_yticks(np.arange(0, 1.01, 0.2))
+ax.set_yticklabels([f"{v:.1f}" for v in np.arange(0, 1.01, 0.2)])
+
+plt.tight_layout()
+plt.show()
+```
+
+
+Ocena jakości reprezentacji zmiennych wskazuje, że dwie pierwsze składowe główne zachowują od 66,8% do 87,4% wariancji poszczególnych odcinków maratonu. Najwyższą jakość odwzorowania uzyskano dla odcinka 5–10 km (87,4%), natomiast najniższą dla 25–30 km (66,8%). Większość analizowanych zmiennych jest reprezentowana przede wszystkim przez PC1. Wyjątek stanowi odcinek 20–25 km, którego zmienność jest wyjaśniana głównie przez PC2 (83,9%). Wyniki potwierdzają, że druga składowa wnosi istotną informację o przebiegu środkowej części maratonu, której nie ujmuje pierwsza składowa.
+
+
+## Analiza wrażliwości PCA na obserwacje odstające
+
+```{python}
+#| label: pca-wrazliwosc
+#| echo: false
+#| fig-width: 9
+#| fig-height: 4.5
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from IPython.display import display
+
+# Odległość każdego zawodnika od przeciętnego profilu tempa
+odleglosc = np.linalg.norm(X_scaled, axis=1)
+
+# Wyłączenie 1% najbardziej odległych obserwacji
+prog = np.quantile(odleglosc, 0.99)
+maska = odleglosc <= prog
+
+X_bez_odstajacych = X.loc[maska]
+
+# Ponowna standaryzacja i PCA
+scaler_rob = StandardScaler()
+X_rob_scaled = scaler_rob.fit_transform(X_bez_odstajacych)
+
+pca_rob = PCA()
+pca_rob.fit(X_rob_scaled)
+
+# Dopasowanie znaków składowych do pierwotnej PCA
+skladowe_rob = pca_rob.components_[:2].copy()
+
+for i in range(2):
+    if np.dot(pca.components_[i], skladowe_rob[i]) < 0:
+        skladowe_rob[i] *= -1
+
+ladunki_rob = skladowe_rob.T * np.sqrt(
+    pca_rob.explained_variance_[:2]
+)
+
+# Porównanie wariancji wyjaśnionej
+porownanie_wariancji = pd.DataFrame({
+    "Składowa": ["PC1", "PC2", "Łącznie"],
+    "Pełny zbiór (%)": [
+        pca.explained_variance_ratio_[0] * 100,
+        pca.explained_variance_ratio_[1] * 100,
+        pca.explained_variance_ratio_[:2].sum() * 100
+    ],
+    "Bez 1% obserwacji skrajnych (%)": [
+        pca_rob.explained_variance_ratio_[0] * 100,
+        pca_rob.explained_variance_ratio_[1] * 100,
+        pca_rob.explained_variance_ratio_[:2].sum() * 100
+    ]
+})
+
+display(
+    porownanie_wariancji.style
+    .hide(axis="index")
+    .format({
+        "Pełny zbiór (%)": "{:.2f}",
+        "Bez 1% obserwacji skrajnych (%)": "{:.2f}"
+    })
+)
+
+# Porównanie ładunków
+fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+
+for i, ax in enumerate(axes):
+    ax.scatter(
+        ladunki.iloc[:, i],
+        ladunki_rob[:, i],
+        alpha=0.85,
+        s=50
+    )
+
+    for j, nazwa in enumerate(X.columns):
+        ax.annotate(
+            nazwa,
+            (ladunki.iloc[j, i], ladunki_rob[j, i]),
+            xytext=(4, 4),
+            textcoords="offset points",
+            fontsize=8
+        )
+
+    ax.plot(
+        [-1, 1], [-1, 1],
+        linestyle="--",
+        color="gray",
+        linewidth=1
+    )
+
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Ładunki – pełny zbiór")
+    ax.set_ylabel("Ładunki – bez obserwacji skrajnych")
+    ax.set_title(f"PC{i+1}")
+    ax.grid(alpha=0.2)
+
+plt.tight_layout()
+plt.show()
+
+# Podsumowanie
+print(
+    f"Wyłączone obserwacje: {(~maska).sum():,} "
+    f"({(~maska).mean()*100:.2f}%)"
+)
+
+for i in range(2):
+    zgodnosc = np.corrcoef(
+        ladunki.iloc[:, i],
+        ladunki_rob[:, i]
+    )[0, 1]
+
+    print(f"Zgodność ładunków PC{i+1}: {zgodnosc:.3f}")
+```
+
+
+W celu oceny stabilności wyników PCA przeprowadzono analizę wrażliwości polegającą na wyłączeniu 1% obserwacji o największej odległości euklidesowej od środka standaryzowanej przestrzeni zmiennych (6322 zawodników). Następnie ponownie przeprowadzono standaryzację i analizę składowych głównych.
+
+Po wyłączeniu obserwacji skrajnych udział wariancji wyjaśnionej przez PC1 zmniejszył się z 61,24% do 61,05%, natomiast dla PC2 wzrósł z 19,48% do 20,22%. Łączna wariancja wyjaśniona przez dwie składowe zwiększyła się nieznacznie, z 80,72% do 81,27%. Porównanie ładunków wskazuje na zachowanie bardzo zbliżonej struktury obu składowych.
+
+Uzyskane wyniki sugerują, że wyodrębnione wymiary strategii tempa są względnie stabilne, a 1% najbardziej nietypowych obserwacji nie wpływa istotnie na ich interpretację. Wniosek ten dotyczy zastosowanego wariantu analizy wrażliwości i nie wyklucza wpływu innych sposobów doboru lub przekształcania danych.
